@@ -1,0 +1,208 @@
+# SearXNG Configuration - Complete with required defaults
+# Supports English, Chinese (Simplified/Traditional), Vietnamese, and Japanese
+# Includes all required configurations to prevent KeyError issues
+
+use_default_settings: false
+
+general:
+  debug: true
+  instance_name: "FizenRAG Search"
+  enable_metrics: true
+
+brand:
+  new_issue_url: https://github.com/searxng/searxng/issues/new
+  docs_url: https://docs.searxng.org/
+  public_instances: https://searx.space
+  wiki_url: https://github.com/searxng/searxng/wiki
+  issue_url: https://github.com/searxng/searxng/issues
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en-US"
+  # Support multiple languages including Asian languages
+  languages:
+    - en
+    - en-US
+    - zh
+    - zh-CN
+    - zh-TW
+    - vi
+    - ja
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  suspended_times:
+    SearxEngineAccessDenied: 86400
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 3600
+    cf_SearxEngineCaptcha: 1296000
+    cf_SearxEngineAccessDenied: 86400
+    recaptcha_SearxEngineCaptcha: 604800
+  formats:
+    - html
+    - json
+
+# Preferences configuration to prevent validation errors
+preferences:
+  lock:
+    - method
+    - safesearch
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "EyfY3ezjAuvtGBLz38sxMtbXA0BwONtzn8ryPAqxFoj6bbdz0HYGj4vTogfXN1RB"
+  limiter: false # Disable limiter for internal use
+  public_instance: false
+  image_proxy: true
+  http_protocol_version: "1.0"
+  method: "POST"
+  default_http_headers:
+    X-Content-Type-Options: nosniff
+    X-Download-Options: noopen
+    X-Robots-Tag: noindex, nofollow
+    Referrer-Policy: no-referrer
+
+redis:
+  url: false
+
+ui:
+  static_use_hash: false
+  query_in_title: false
+  infinite_scroll: false
+  default_theme: simple
+  center_alignment: false
+  default_locale: "en"
+  theme_args:
+    simple_style: auto
+  search_on_category_select: true
+  hotkeys: default
+  url_formatting: pretty
+
+outgoing:
+  request_timeout: 10.0
+  useragent_suffix: "FizenRAG/1.0"
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+
+# Plugin configuration (required by SearXNG)
+plugins:
+  searx.plugins.calculator.SXNGPlugin:
+    active: true
+  searx.plugins.hash_plugin.SXNGPlugin:
+    active: true
+  searx.plugins.self_info.SXNGPlugin:
+    active: true
+  searx.plugins.unit_converter.SXNGPlugin:
+    active: true
+  searx.plugins.ahmia_filter.SXNGPlugin:
+    active: false # Disable bot detection related plugins
+  searx.plugins.hostnames.SXNGPlugin:
+    active: true
+  searx.plugins.oa_doi_rewrite.SXNGPlugin:
+    active: false
+  searx.plugins.tor_check.SXNGPlugin:
+    active: false
+  searx.plugins.tracker_url_remover.SXNGPlugin:
+    active: false
+
+# Checker configuration - disable bot detection
+checker:
+  off_when_debug: true
+
+# Bot detection configuration - disable for internal use
+botdetection:
+  ip_limit:
+    filter_link_local: false
+    link_token: false
+
+# Categories configuration - Only categories we have engines for
+categories_as_tabs:
+  general:
+  it:
+  science:
+
+# ONLY ESSENTIAL ENGINES - All others disabled
+engines:
+  # Core search engines
+  - name: google
+    engine: google
+    shortcut: go
+    categories: [general]
+    timeout: 10.0
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    categories: [general]
+    timeout: 10.0
+
+  # Regional engines for Asian languages
+  - name: baidu
+    engine: baidu
+    shortcut: bd
+    categories: [general]
+    baidu_category: general
+    timeout: 15.0
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    categories: [general]
+    timeout: 10.0
+
+  # Knowledge sources
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    categories: [general]
+    display_type: ["infobox"]
+    timeout: 10.0
+
+  # Academic sources
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gos
+    categories: [science]
+    timeout: 15.0
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    categories: [science]
+    timeout: 10.0
+
+  # Technical sources
+  - name: stackoverflow
+    engine: stackexchange
+    shortcut: st
+    api_site: "stackoverflow"
+    categories: [it]
+    timeout: 10.0
+
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: [it]
+    timeout: 10.0
+
+# Localization support for multiple languages
+locales:
+  en: English
+  zh: 中文
+  zh-CN: 中文 (简体)
+  zh-TW: 中文 (繁體)
+  vi: Tiếng Việt
+  ja: 日本語
+
+# DOI resolver configuration (required by SearXNG)
+doi_resolvers:
+  oadoi.org: "https://oadoi.org/"
+  doi.org: "https://doi.org/"
+  doai.io: "https://dissem.in/"
+  sci-hub.se: "https://sci-hub.se/"
+  sci-hub.st: "https://sci-hub.st/"
+  sci-hub.ru: "https://sci-hub.ru/"
+
+default_doi_resolver: "oadoi.org"

@@ -1,0 +1,294 @@
+# SearXNG Configuration - Essential Engines with Multi-Language Support
+# Supports English, Chinese (Simplified/Traditional), Vietnamese, and Japanese
+# Keeps only the most reliable engines for RAG system
+
+use_default_settings: false
+
+general:
+  debug: true
+  instance_name: "FizenRAG Search"
+  enable_metrics: true
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en-US"
+  # Support multiple languages including Asian languages
+  languages:
+    - en
+    - en-US
+    - zh
+    - zh-CN
+    - zh-TW
+    - vi
+    - ja
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "ultrasecretkey"
+  limiter: true
+  public_instance: false
+  image_proxy: true
+
+ui:
+  default_locale: "en"
+  search_on_category_select: true
+
+# Localization support for multiple languages
+locales:
+  en: English
+  zh: 中文
+  zh-CN: 中文 (简体)
+  zh-TW: 中文 (繁體)
+  vi: Tiếng Việt
+  ja: 日本語
+
+outgoing:
+  request_timeout: 10.0
+  useragent_suffix: "FizenRAG/1.0"
+
+# ONLY ESSENTIAL ENGINES - All others disabled
+engines:
+  # Core search engines
+  - name: google
+    engine: google
+    shortcut: go
+    categories: [general, web]
+    timeout: 10.0
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    categories: [general, web]
+    timeout: 10.0
+
+  # Regional engines for Asian languages
+  - name: baidu
+    engine: baidu
+    shortcut: bd
+    categories: [general, web]
+    baidu_category: general
+    timeout: 15.0
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    categories: [general, web]
+    timeout: 10.0
+
+  # Knowledge sources
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    categories: [general]
+    display_type: ["infobox"]
+    timeout: 10.0
+
+  # Academic sources
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gos
+    categories: [science]
+    timeout: 15.0
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    categories: [science]
+    timeout: 10.0
+
+  # Technical sources
+  - name: stackoverflow
+    engine: stackexchange
+    shortcut: st
+    api_site: "stackoverflow"
+    categories: [it, q&a]
+    timeout: 10.0
+
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: [it]
+    timeout: 10.0
+
+# DISABLE ALL OTHER ENGINES
+disabled_engines:
+  # Problematic engines with parsing errors
+  - qwant
+  - qwant news
+  - qwant images
+  - qwant videos
+  - reuters
+  - startpage
+  - startpage news
+  - startpage images
+
+  # News engines (keeping focused on knowledge sources)
+  - bing news
+  - google news
+  - yahoo news
+  - brave.news
+  - duckduckgo news
+  - wikinews
+
+  # Image engines (not needed for RAG)
+  - bing images
+  - google images
+  - duckduckgo images
+  - brave.images
+  - flickr
+  - unsplash
+  - deviantart
+  - imgur
+
+  # Video engines (not needed for RAG)
+  - bing videos
+  - google videos
+  - duckduckgo videos
+  - brave.videos
+  - youtube
+  - dailymotion
+  - vimeo
+  - niconico
+
+  # Social and forum engines
+  - reddit
+  - mastodon users
+  - mastodon hashtags
+  - lemmy communities
+  - lemmy users
+  - lemmy posts
+  - lemmy comments
+
+  # Other search engines (keeping bing enabled above for better coverage)
+  - brave
+  - yandex
+  - yahoo
+  - searx
+  - mojeek
+  - presearch
+  - seekr news
+  - stract
+  - yep
+
+  # Specialized engines
+  - currency
+  - wolframalpha
+  - openstreetmap
+  - apple maps
+  - photon
+
+  # File and package repositories
+  - library genesis
+  - z-library
+  - piratebay
+  - kickass
+  - 1337x
+  - solidtorrents
+  - bt4g
+  - nyaa
+  - docker hub
+  - npm
+  - pypi
+  - crates.io
+  - packagist
+  - hex
+  - rubygems
+  - pub.dev
+  - pkg.go.dev
+
+  # Media and entertainment
+  - spotify
+  - soundcloud
+  - bandcamp
+  - mixcloud
+  - deezer
+  - steam
+  - epic games store
+  - google play apps
+  - google play movies
+  - apple app store
+
+  # Shopping and commercial
+  - amazon
+  - ebay
+  - geizhals
+
+  # Translation services
+  - libretranslate
+  - lingva
+  - mozhi
+  - mymemory translated
+  - deepl
+
+  # Wikimedia projects (except wikipedia)
+  - wikibooks
+  - wikiquote
+  - wikisource
+  - wikispecies
+  - wikiversity
+  - wikivoyage
+  - wiktionary
+  - wikicommons.images
+  - wikicommons.videos
+  - wikicommons.audio
+  - wikicommons.files
+
+  # Tech documentation (beyond our essentials)
+  - mdn
+  - cppreference
+  - hoogle
+  - microsoft learn
+  - free software directory
+  - arch linux wiki
+  - gentoo
+
+  # Academic (beyond our essentials)
+  - pubmed
+  - semantic scholar
+  - crossref
+  - openairedatasets
+  - openairepublications
+  - pdbe
+  - springer nature
+
+  # Other specialized
+  - dictzone
+  - duden
+  - wordnik
+  - etymonline
+  - emojipedia
+  - currency
+  - weather
+  - wttr.in
+
+  # Regional/language specific (keeping baidu enabled above for Chinese)
+  - baidu images
+  - baidu kaifa
+  - chinaso news
+  - chinaso images
+  - chinaso videos
+  - naver
+  - naver images
+  - naver news
+  - naver videos
+  - sogou
+  - sogou images
+  - sogou videos
+  - sogou wechat
+  - goo
+  - seznam
+  - yacy
+  - yacy images
+
+categories_as_tabs:
+  general:
+  images:
+  videos:
+  news:
+  it:
+  science:

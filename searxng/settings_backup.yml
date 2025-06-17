@@ -1,0 +1,120 @@
+# SearXNG Configuration for FizenRAG System
+# Minimal configuration to avoid schema validation errors
+
+use_default_settings: true
+
+general:
+  debug: true
+  instance_name: "FizenRAG Search"
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+  enable_metrics: true
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  autocomplete_min: 2
+  default_lang: "en-US"
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  formats:
+    - html
+    - json
+    - csv
+    - rss
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  base_url: "http://localhost:8080/"
+  secret_key: "EyfY3ezjAuvtGBLz38sxMtbXA0BwONtzn8ryPAqxFoj6bbdz0HYGj4vTogfXN1RB"
+  limiter: true
+  public_instance: false
+  image_proxy: true
+  http_protocol_version: "1.1"
+  method: "GET"
+
+ui:
+  static_use_hash: false
+  infinite_scroll: false
+  center_alignment: false
+  search_on_category_select: true
+  hotkeys: default
+  default_locale: "en"
+  results_on_new_tab: false
+  advanced_search: true
+
+outgoing:
+  request_timeout: 15.0
+  useragent_suffix: "FizenRAG/1.0"
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+  verify_ssl: true
+
+# Keep only essential engines to avoid validation issues
+engines:
+  - name: google
+    engine: google
+    shortcut: go
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    display_type: ["infobox"]
+    categories: [general]
+    disabled: false
+
+  - name: stackoverflow
+    engine: stackexchange
+    shortcut: st
+    api_site: "stackoverflow"
+    categories: [it, q&a]
+    disabled: false
+
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gos
+    disabled: false
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    timeout: 4.0
+    disabled: false
+
+# Disable problematic engines
+disabled_engines:
+  - qwant news
+  - qwant images
+  - qwant videos
+  - qwant
+  - reuters
+  - startpage
+  - startpage news
+  - startpage images
+
+categories_as_tabs:
+  general:
+  images:
+  videos:
+  news:
+  it:
+  science:

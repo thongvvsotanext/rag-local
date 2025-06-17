@@ -1,0 +1,584 @@
+version: '3.8'
+
+networks:
+  fizen_rag_network:
+    driver: bridge
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    platform: linux/arm64
+    environment:
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          memory: 512M
+    command: |
+      postgres 
+      -c shared_buffers=128MB 
+      -c max_connections=50
+      -c effective_cache_size=256MB
+      -c maintenance_work_mem=32MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=8MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fizen_user -d fizen_rag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Ollama Service (moved up for better dependency management)
+  ollama:
+    image: ollama/ollama:latest
+    platform: linux/arm64
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_NUM_THREAD=2
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_DEBUG=0
+      - OLLAMA_LOG_LEVEL=info
+      - OLLAMA_MODEL=phi3:mini
+      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_CONTEXT_SIZE=8192
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      #test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s  # Give Ollama time to start up
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./logs/ollama:/var/log/ollama
+      - ./scripts/start-ollama.sh:/start-ollama.sh
+    restart: unless-stopped
+    entrypoint: ["/start-ollama.sh"]
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    platform: linux/arm64
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --save 60 1 --loglevel warning
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # SearXNG Service
+  searxng:
+    image: searxng/searxng:latest
+    platform: linux/arm64
+    ports:
+      - "8080:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      - INSTANCE_NAME=FizenRAG
+      - AUTOCOMPLETE=google
+      - SAFE_SEARCH=0
+      - DEFAULT_LOCALE=en-US
+      - SEARXNG_SETTINGS=/etc/searxng/settings.yml
+      - SEARXNG_SECRET_KEY=EyfY3ezjAuvtGBLz38sxMtbXA0BwONtzn8ryPAqxFoj6bbdz0HYGj4vTogfXN1RB
+    volumes:
+      - searxng_data:/etc/searxng
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # LLM Orchestrator (depends on Ollama)
+  llm-orchestrator:
+    build:
+      context: ./services/llm_orchestrator
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8008:8008"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - OLLAMA_URL=http://ollama:11434
+      - RETRIEVAL_ORCHESTRATOR_URL=http://retrieval-orchestrator:8002
+      - RESPONSE_FORMATTER_URL=http://response-formatter:8009
+      # Model Configuration
+      - BASE_MODEL=phi3:mini
+      - CONTEXT_SIZE=8192
+      - DEFAULT_MODEL=phi3-mini-8192k
+      # Connection
+      - OLLAMA_CONNECT_TIMEOUT=300
+      - OLLAMA_READ_TIMEOUT=3000
+      - OLLAMA_TOTAL_TIMEOUT=6000
+      - MAX_STARTUP_RETRIES=30
+      - STARTUP_RETRY_DELAY=0.0
+      - MAX_RETRIES=3
+      - MAX_TOKENS=8000
+      - RETRY_DELAY=2.0
+      # Generation Parameters  
+      - NUM_PREDICT=4000
+      - TEMPERATURE=0.7
+      - TOP_P=0.9
+      - TOP_K=40
+      - REPEAT_PENALTY=1.1
+      - REPEAT_LAST_N=64
+      - SEED=-1
+      - STOP_SEQUENCES="</s>,###,STOP"
+      # Log
+      - LOG_PROMPT_MAX_LENGTH=1000        # Max characters of prompt to log
+      - LOG_RESPONSE_MAX_LENGTH=1000      # Max characters of response to log  
+      - LOG_FULL_CONTENT=true           # Set to 'true' to log full prompts/responses
+    depends_on:
+      db:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 180s
+      timeout: 60s
+      retries: 3
+      start_period: 300s  # Give 5 minutes for startup including model pulling
+    restart: unless-stopped
+
+  # Vector Service
+  vector-service:
+    build:
+      context: ./services/vector_retriever
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - FAISS_INDEX_PATH=/app/data/faiss_index
+      - UPLOAD_DIR=/app/data/uploads
+      - MODEL_NAME=BAAI/bge-small-en-v1.5
+      - CHUNK_SIZE=500
+      - CHUNK_OVERLAP=50
+      - SEARXNG_URL=http://searxng:8080
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+    volumes:
+      - faiss_data:/app/data/faiss_index
+      - uploaded_files:/app/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 3G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 60s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  # SQL Retriever (depends on LLM Orchestrator)
+  sql-retriever:
+    build:
+      context: ./services/sql_retriever
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8005:8005"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - LLM_ORCHESTRATOR_URL=http://llm-orchestrator:8008
+      - LLM_REQUEST_TIMEOUT=180
+      - MAX_RETRIES=3
+      - RETRY_DELAY=1.0
+      #Enable/disable database querying
+      - ENABLE_DB_QUERY=false
+      - DB_QUERY_DISABLED_MESSAGE="Database querying is currently disabled"
+    depends_on:
+      db:
+        condition: service_healthy
+      llm-orchestrator:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # Web Retriever
+  web-retriever:
+    build:
+      context: ./services/web_retriever
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8006:8006"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - SEARXNG_URL=http://searxng:8080
+      - OLLAMA_URL=http://ollama:11434
+      - VECTOR_SERVICE_URL=http://vector-service:8003
+    depends_on:
+      db:
+        condition: service_started
+      searxng:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Context Manager
+  context-manager:
+    build:
+      context: ./services/context_manager
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 60s
+      timeout: 60s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+  # Response Formatter
+  response-formatter:
+    build:
+      context: ./services/response_formatter
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8009:8009"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+    depends_on:
+      db:
+        condition: service_started
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # Prompt Builder
+  prompt-builder:
+    build:
+      context: ./services/prompt_builder
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8007:8007"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # Retrieval Orchestrator
+  retrieval-orchestrator:
+    build:
+      context: ./services/retrieval_orchestrator
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://fizen_user:fizen_password@db:5432/fizen_rag
+      - VECTOR_SERVICE_URL=http://vector-service:8003
+      - WEB_RETRIEVER_URL=http://web-retriever:8006
+      - SQL_RETRIEVER_URL=http://sql-retriever:8005
+    depends_on:
+      db:
+        condition: service_started
+      vector-service:
+        condition: service_healthy
+      web-retriever:
+        condition: service_healthy
+      sql-retriever:
+        condition: service_healthy
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 120s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # API Service
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "8000:8000"
+    environment:
+      - VECTOR_SERVICE_URL=http://vector-service:8003
+      - LLM_ORCHESTRATOR_URL=http://llm-orchestrator:8008
+      - RETRIEVAL_ORCHESTRATOR_URL=http://retrieval-orchestrator:8002
+      - CONTEXT_MANAGER_URL=http://context-manager:8001
+      - RESPONSE_FORMATTER_URL=http://response-formatter:8009
+      - WEB_RETRIEVER_URL=http://web-retriever:8006
+      - PROMPT_BUILDER_URL=http://prompt-builder:8007
+      - POSTGRES_USER=fizen_user
+      - POSTGRES_PASSWORD=fizen_password
+      - POSTGRES_DB=fizen_rag
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8000
+      - FRONTEND_URL=http://localhost:3000
+    networks:
+      - fizen_rag_network
+    depends_on:
+      db:
+        condition: service_healthy
+      vector-service:
+        condition: service_healthy
+      llm-orchestrator:
+        condition: service_healthy
+      retrieval-orchestrator:
+        condition: service_healthy
+      context-manager:
+        condition: service_healthy
+      response-formatter:
+        condition: service_healthy
+      web-retriever:
+        condition: service_healthy
+      prompt-builder:
+        condition: service_healthy
+      sql-retriever:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    platform: linux/arm64
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - fizen_rag_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local
+  searxng_data:
+    driver: local
+  faiss_data:
+    driver: local
+  uploaded_files:
+    driver: local
+  web_retriever_data:
+    driver: local

@@ -1,0 +1,31 @@
+# SearXNG Rate Limiter Configuration
+
+[botdetection.ip_limit]
+# Enable IP-based rate limiting
+filter_link_local = true
+link_token = true
+
+[botdetection.ip_lists]
+# Configure IP filtering
+pass_searxng_org = true
+
+[real_ip]
+# Real IP detection (useful if behind proxy)
+x_for = 1
+
+[server]
+# Server limits
+limiter = true
+public_instance = false
+image_proxy = true
+
+# Basic rate limiting rules
+[botdetection.ip_limit.GET]
+# 10 requests per minute for GET requests
+window = 60
+limit = 10
+
+[botdetection.ip_limit.POST] 
+# 5 requests per minute for POST requests
+window = 60
+limit = 5
