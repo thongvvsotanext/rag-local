@@ -934,7 +934,8 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                 repeat_penalty = request.parameters.get("repeat_penalty", REPEAT_PENALTY)
                 repeat_last_n = request.parameters.get("repeat_last_n", REPEAT_LAST_N)
                 seed = request.parameters.get("seed", SEED)
-                stop_sequences = request.parameters.get("stop_sequences", STOP_SEQUENCES)
+                #stop_sequences = request.parameters.get("stop_sequences", STOP_SEQUENCES)
+                stop_sequences = request.parameters.get("stop_sequences", [])
                 
                 # Build options dict
                 options = {
@@ -951,10 +952,12 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                 if seed != -1:
                     options["seed"] = seed
                 
-                # Add stop sequences if provided
+                # Only add stop sequences if explicitly provided and non-empty
                 if stop_sequences and any(s.strip() for s in stop_sequences):
                     options["stop"] = [s.strip() for s in stop_sequences if s.strip()]
+                    log_with_context(logger, 'info', f"Using stop sequences: {options['stop']}", request_id, "generate")
                 
+
                 request_data = {
                     "model": model_to_use,
                     "prompt": request.prompt,
@@ -1002,20 +1005,57 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                     
                     # Calculate processing time
                     processing_time = time.time() - start_time
+
+                    # FIXED: Better response extraction and validation
+                    raw_response = result.get("response", "")
+
+                    # Clean up the response - remove markdown wrapper if it exists
+                    clean_response = raw_response
+                    if clean_response.startswith("```markdown\n"):
+                        clean_response = clean_response[12:]  # Remove ```markdown\n
+                    if clean_response.endswith("```"):
+                        clean_response = clean_response[:-3]  # Remove trailing ```
+
+                    clean_response = clean_response.strip()
+
+                    # If response is empty or too short, log details for debugging
+                    if len(clean_response) < 10:
+                        log_with_context(
+                            logger, 'warning',
+                            "Generated response is very short",
+                            request_id, "generate",
+                            raw_response=raw_response,
+                            clean_response=clean_response,
+                            result_keys=list(result.keys()),
+                            full_result=result,
+                            attempt=attempt + 1
+                        )
+                        
+                        # If we have retries left and response is empty, try again
+                        if attempt < max_retries - 1 and len(clean_response) < 5:
+                            log_with_context(
+                                logger, 'info',
+                                "Retrying due to short response",
+                                request_id, "generate",
+                                attempt=attempt + 1
+                            )
+                            await asyncio.sleep(2)  # Wait before retry
+                            continue
                     
                     # Extract token count from response
-                    token_count = result.get("eval_count", 0) or len(tokenizer.encode(result.get("response", "")))
+                    #token_count = result.get("eval_count", 0) or len(tokenizer.encode(result.get("response", "")))
                     
                     response_data = {
-                        "response": result.get("response", ""),
+                        "response": clean_response if clean_response else raw_response,  # Fallback to raw if cleaning fails
                         "metadata": {
                             "model": model_to_use,
                             "base_model": BASE_MODEL,
                             "context_size": context_size,
-                            "custom_model_used": is_custom_model(model_to_use, BASE_MODEL, context_size),
                             "processing_time": processing_time,
-                            "token_count": token_count,
+                            "token_count": result.get("eval_count", 0),
                             "attempt": attempt + 1,
+                            "raw_response_length": len(raw_response),
+                            "clean_response_length": len(clean_response),
                             "generation_params": {
                                 "num_predict": num_predict,
                                 "temperature": temperature,
@@ -1023,7 +1063,6 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                                 "top_k": top_k,
                                 "repeat_penalty": repeat_penalty,
                                 "repeat_last_n": repeat_last_n,
-                                "seed": seed if seed != -1 else "random",
                                 "stop_sequences": stop_sequences
                             },
                             "ollama_stats": {
@@ -1039,21 +1078,33 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                     
                     log_with_context(
                         logger, 'info',
-                        f"GENERATE_SUCCESS - Generation completed successfully",
-                        request_id, "generate",
-                        model=model_to_use,
+                        "GENERATE_REQUEST_SUCCESS - Generation request completed successfully",
+                        request_id, "/generate",
+                        input_tokens=result.get("prompt_eval_count", 0),
                         prompt_length=len(request.prompt),
-                        prompt_preview=truncate_for_log(request.prompt, 100),
+                        prompt_preview=request.prompt[:100] + "..." if len(request.prompt) > 100 else request.prompt,
                         prompt_hash=hash(request.prompt) % 10000,
+                        output_tokens=result.get("eval_count", 0),
                         response_length=len(response_data["response"]),
-                        response_preview=truncate_for_log(response_data["response"], 100),
+                        response_preview=response_data["response"][:100] + "..." if len(response_data["response"]) > 100 else response_data["response"],
                         response_hash=hash(response_data["response"]) % 10000,
                         processing_time_seconds=round(processing_time, 3),
-                        token_count=token_count,
-                        attempt=attempt + 1,
+                        total_time_seconds=round(processing_time, 2),
+                        model=model_to_use,
                         context_size=context_size,
-                        custom_model_used=response_data["metadata"]["custom_model_used"],
-                        generation_params=response_data["metadata"]["generation_params"]
+                        custom_model_used=True,
+                        generation_params_used={
+                            "num_predict": num_predict,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "top_k": top_k,
+                            "repeat_penalty": repeat_penalty,
+                            "repeat_last_n": repeat_last_n,
+                            "seed": "random",
+                            "stop_sequences": stop_sequences
+                        },
+                        full_prompt=enhanced_prompt,
+                        full_response=response_data["response"]
                     )
                     
                     return response_data
@@ -1070,6 +1121,7 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
             if attempt == max_retries - 1:
                 raise HTTPException(status_code=408, detail=f"Generation timeout after {OLLAMA_TOTAL_TIMEOUT} seconds")
             
+            # Wait before retry
             await asyncio.sleep(RETRY_DELAY * (attempt + 1))
             continue
             
