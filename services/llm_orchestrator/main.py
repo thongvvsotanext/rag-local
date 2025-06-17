@@ -1103,7 +1103,7 @@ async def generate_with_retry(request: LLMRequest, max_retries: int = 3, request
                             "seed": "random",
                             "stop_sequences": stop_sequences
                         },
-                        full_prompt=enhanced_prompt,
+                        full_prompt=request.prompt,
                         full_response=response_data["response"]
                     )
                     
