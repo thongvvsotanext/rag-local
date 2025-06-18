@@ -275,6 +275,42 @@ class ChatContextResult(BaseModel):
     score: float
     message_type: str
 
+# Input/Output Models for /embed endpoint
+class EmbedRequest(BaseModel):
+    """Request model for embedding generation."""
+    texts: Union[str, List[str]] = Field(..., description="Text or list of texts to embed")
+    batch_size: Optional[int] = Field(8, ge=1, le=32, description="Batch size for processing (max 32 for M2 Mac)")
+    normalize_embeddings: Optional[bool] = Field(False, description="Whether to normalize embeddings to unit length")
+    include_metadata: Optional[bool] = Field(False, description="Whether to include processing metadata")
+    
+    @validator('texts')
+    def validate_texts(cls, v):
+        if isinstance(v, str):
+            return [v]  # Convert single string to list
+        if isinstance(v, list):
+            if not v:
+                raise ValueError("texts cannot be empty")
+            if len(v) > 32:
+                raise ValueError("Maximum 32 texts allowed for M2 Mac")
+            # Validate each text
+            for i, text in enumerate(v):
+                if not isinstance(text, str):
+                    raise ValueError(f"Text at index {i} must be a string")
+                if len(text.strip()) == 0:
+                    raise ValueError(f"Text at index {i} cannot be empty")
+                if len(text) > 8192:  # Reasonable limit for BGE-small
+                    raise ValueError(f"Text at index {i} too long (max 8192 characters)")
+        return v
+
+class EmbedResponse(BaseModel):
+    """Response model for embedding generation."""
+    embeddings: List[List[float]] = Field(..., description="Generated embeddings")
+    model: str = Field(..., description="Model used for embedding generation")
+    dimension: int = Field(..., description="Embedding dimension")
+    processing_time_seconds: float = Field(..., description="Total processing time")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional processing metadata")
+
+
 # Add new model for crawl job statistics
 class CrawlJobStats(BaseModel):
     total_pages: int
@@ -416,6 +452,157 @@ def normalize_text(text: str) -> str:
     normalized = ' '.join(normalized.split())
     
     return normalized
+
+# Enhanced embedding functions with better error handling and logging
+async def embed_text_enhanced(text: str, normalize: bool = False) -> List[float]:
+    """Generate embedding for a single text with enhanced error handling."""
+    try:
+        # Input validation
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+        
+        # Truncate if too long (BGE-small has 512 token limit)
+        text = text[:8192]  # Conservative character limit
+        
+        # Tokenize with error handling
+        inputs = tokenizer(
+            [text], 
+            padding=True, 
+            truncation=True, 
+            return_tensors="pt", 
+            max_length=512
+        )
+
+        # Move to appropriate device
+        if device.type == "mps":
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            output = model(**inputs)
+
+        # Extract embedding (mean pooling)
+        embedding = output.last_hidden_state.mean(dim=1).cpu().numpy().flatten()
+        
+        # Normalize if requested
+        if normalize:
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+        
+        # Convert to list
+        embedding_list = embedding.tolist()
+
+        # Clean up GPU memory on M2
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+        return embedding_list
+
+    except Exception as e:
+        # Clean up on error
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        raise RuntimeError(f"Error generating embedding: {str(e)}")
+
+async def embed_texts_batch_enhanced(
+    texts: List[str], 
+    batch_size: int = 8,
+    normalize: bool = False,
+    include_metadata: bool = False
+) -> Dict[str, Any]:
+    """Generate embeddings for multiple texts with enhanced batching and metadata."""
+    start_time = time.time()
+    all_embeddings = []
+    processing_metadata = {
+        "total_texts": len(texts),
+        "batch_size": batch_size,
+        "batches_processed": 0,
+        "avg_batch_time": 0,
+        "total_tokens_processed": 0,
+        "device_used": str(device),
+        "model_name": model_name
+    }
+    
+    batch_times = []
+
+    try:
+        # Process in batches for M2 memory management
+        for i in range(0, len(texts), batch_size):
+            batch_start_time = time.time()
+            batch_texts = texts[i:i + batch_size]
+            
+            # Truncate texts in batch
+            batch_texts = [text[:8192] for text in batch_texts]
+            
+            # Tokenize batch
+            inputs = tokenizer(
+                batch_texts, 
+                padding=True, 
+                truncation=True, 
+                return_tensors="pt", 
+                max_length=512
+            )
+
+            # Track token count for metadata
+            if include_metadata:
+                processing_metadata["total_tokens_processed"] += sum(
+                    (inputs["input_ids"] != tokenizer.pad_token_id).sum().item() 
+                    for _ in range(len(batch_texts))
+                )
+
+            # Move to appropriate device
+            if device.type == "mps":
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                output = model(**inputs)
+
+            # Extract embeddings (mean pooling)
+            batch_embeddings = output.last_hidden_state.mean(dim=1).cpu().numpy()
+            
+            # Normalize if requested
+            if normalize:
+                norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+                batch_embeddings = batch_embeddings / np.maximum(norms, 1e-8)
+            
+            # Convert to list and add to results
+            batch_embeddings_list = batch_embeddings.tolist()
+            all_embeddings.extend(batch_embeddings_list)
+
+            # Clean up memory after each batch
+            del output, inputs
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            
+            # Record batch timing
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+            processing_metadata["batches_processed"] += 1
+            
+            # Force garbage collection for memory management
+            import gc
+            gc.collect()
+
+        # Calculate metadata
+        total_time = time.time() - start_time
+        processing_metadata["avg_batch_time"] = sum(batch_times) / len(batch_times) if batch_times else 0
+        
+        result = {
+            "embeddings": all_embeddings,
+            "processing_time_seconds": total_time
+        }
+        
+        if include_metadata:
+            result["metadata"] = processing_metadata
+            
+        return result
+
+    except Exception as e:
+        # Clean up on error
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        raise RuntimeError(f"Error in batch embedding generation: {str(e)}")
+
 
 @lru_cache(maxsize=1000)
 async def get_embedding(text: str) -> List[float]:
@@ -1335,6 +1522,142 @@ async def get_content_distribution():
     except Exception as e:
         logger.error(f"Error getting content distribution: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+#--
+# Enhanced /embed endpoint with comprehensive functionality
+@app.post("/embed", response_model=EmbedResponse)
+async def embed_endpoint(request: EmbedRequest):
+    """
+    Enhanced embedding generation endpoint for Vector Service Container.
+    
+    Supports both single text and batch text embedding generation with:
+    - Input validation and sanitization
+    - M2 Mac memory optimization
+    - Batch processing with configurable batch size
+    - Optional embedding normalization
+    - Comprehensive error handling
+    - Processing metadata and timing information
+    - Proper resource cleanup
+    """
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    # Set up logging context
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info(f"EMBED_REQUEST - Starting embedding generation", extra={
+            "request_id": request_id,
+            "num_texts": len(request.texts),
+            "batch_size": request.batch_size,
+            "normalize": request.normalize_embeddings,
+            "include_metadata": request.include_metadata
+        })
+        
+        # Input validation
+        if not request.texts:
+            raise HTTPException(status_code=400, detail="No texts provided")
+        
+        # Generate embeddings
+        result = await embed_texts_batch_enhanced(
+            texts=request.texts,
+            batch_size=request.batch_size,
+            normalize=request.normalize_embeddings,
+            include_metadata=request.include_metadata
+        )
+        
+        # Validate embedding dimensions
+        embeddings = result["embeddings"]
+        if embeddings:
+            expected_dim = 384  # BGE-small dimension
+            actual_dim = len(embeddings[0])
+            if actual_dim != expected_dim:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Embedding dimension mismatch: expected {expected_dim}, got {actual_dim}"
+                )
+        
+        # Prepare response
+        response = EmbedResponse(
+            embeddings=embeddings,
+            model=model_name,
+            dimension=len(embeddings[0]) if embeddings else 0,
+            processing_time_seconds=result["processing_time_seconds"],
+            metadata=result.get("metadata") if request.include_metadata else None
+        )
+        
+        logger.info(f"EMBED_SUCCESS - Embedding generation completed", extra={
+            "request_id": request_id,
+            "num_embeddings": len(embeddings),
+            "dimension": response.dimension,
+            "processing_time_seconds": response.processing_time_seconds,
+            "total_time_seconds": round(time.time() - start_time, 3)
+        })
+        
+        return response
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Log error and return 500
+        error_msg = f"Embedding generation failed: {str(e)}"
+        logger.error(f"EMBED_ERROR - {error_msg}", extra={
+            "request_id": request_id,
+            "error": str(e),
+            "processing_time_seconds": round(time.time() - start_time, 3)
+        })
+        raise HTTPException(status_code=500, detail=error_msg)
+
+# Health check enhancement for embedding service
+@app.get("/embed/health")
+async def embed_health_check():
+    """Health check specifically for embedding functionality."""
+    try:
+        # Test embedding generation with a simple text
+        test_text = "This is a test sentence for health check."
+        test_embedding = await embed_text_enhanced(test_text)
+        
+        return {
+            "status": "healthy",
+            "embedding_service": "operational",
+            "model": model_name,
+            "device": str(device),
+            "dimension": len(test_embedding),
+            "test_embedding_generated": True,
+            "torch_mps_available": torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy", 
+            "embedding_service": "failed",
+            "error": str(e)
+        }
+
+# Utility endpoint to get embedding model information
+@app.get("/embed/info")
+async def embed_model_info():
+    """Get information about the embedding model and configuration."""
+    return {
+        "model_name": model_name,
+        "dimension": 384,  # BGE-small dimension
+        "max_sequence_length": 512,
+        "device": str(device),
+        "batch_size_limit": 32,
+        "supported_features": [
+            "single_text_embedding",
+            "batch_text_embedding", 
+            "embedding_normalization",
+            "processing_metadata",
+            "m2_optimization"
+        ],
+        "hardware_optimization": {
+            "mps_available": torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False,
+            "current_device": str(device),
+            "memory_optimized": True
+        }
+    }
+#--
 
 @app.get("/health")
 async def health_check():
