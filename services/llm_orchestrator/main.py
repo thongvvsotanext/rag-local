@@ -1215,6 +1215,116 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+def summarize_history(conversation_history: List[Dict[str, Any]]) -> str:
+    """
+    Summarize conversation history for prompt context.
+    Each turn should be formatted as:
+    User: <user message>
+    System: <system response>
+    """
+    summary = []
+    for turn in conversation_history:
+        user = turn.get("user")
+        system = turn.get("system")
+        if user:
+            summary.append(f"User: {user}")
+        if system:
+            summary.append(f"System: {system}")
+    return "\n".join(summary)
+
+@app.post("/normalize-search", response_model=LLMResponse)
+async def normalize_search_query(
+    input_query: str,
+    conversation_history: List[Dict[str, Any]],
+    previous_response: str = ""
+) -> LLMResponse:
+    """
+    Generate a normalized search query using conversation history + previous response.
+    """
+    request_id = str(uuid.uuid4())
+    try:
+        log_with_context(
+            logger, 'info',
+            "NORMALIZE_START - Starting normalization",
+            request_id, "/normalize-search",
+            input_query=input_query,
+            conversation_history_preview=truncate_for_log(str(conversation_history), 200),
+            previous_response_preview=truncate_for_log(previous_response, 200)
+        )
+        # Summarize conversation history
+        history_summary = summarize_history(conversation_history)
+
+        # Improved prompt with explicit example
+        prompt = f"""
+You are a search query optimizer tasked with restructuring and normalizing a natural language input into a concise, standardized search query for a search engine API, using conversation history and the previous system response to infer context and intent. Follow these rules:
+1. Use the provided conversation history and previous system response to resolve ambiguities and clarify the user's intent.
+2. Extract key terms relevant to the search intent from the current input and context.
+3. Remove filler words (e.g., "the", "is", "please", "can you").
+4. Convert to lowercase unless case sensitivity is required (e.g., proper nouns, "C++").
+5. Correct spelling or grammar errors (e.g., "beginers" to "beginners").
+6. Replace abbreviations with full terms if ambiguous (e.g., "NY" to "New York").
+7. Preserve technical terms or programming languages (e.g., "C++", "Python").
+8. Remove punctuation unless it's part of a term (e.g., "what's" becomes "whats").
+9. For ambiguous terms (e.g., "apple"), use context to choose the most likely interpretation (e.g., fruit vs. company).
+10. If the input includes location terms like "near me" or "there", infer the location from the conversation history if possible.
+11. Output only the normalized search query, with no explanations or additional text.
+
+Example:
+Conversation History:
+User: what is blockchain
+System: Blockchain is a distributed ledger technology that enables secure, transparent, and tamper-proof record-keeping through consensus mechanisms, blocks, and transactions.
+User: what is blocks
+System: Blocks are data structures within a blockchain that contain a list of transactions and are linked together in a chain.
+Current Input: what is blocks
+Output: what is block of blockchain
+
+Conversation History:
+{history_summary}
+Previous System Response: {previous_response}
+Current Input: {input_query}
+Output:
+"""
+
+        # Payload for Ollama
+        payload = {
+            "model": "llama3.1",
+            "prompt": prompt,
+            "stream": False
+        }
+
+        log_with_context(
+            logger, 'debug',
+            "NORMALIZE_REQUEST - Sending normalization request to LLM",
+            request_id, "/normalize-search",
+            prompt_preview=truncate_for_log(prompt, 200),
+            payload_preview=str({k: v for k, v in payload.items() if k != 'prompt'})
+        )
+
+        # Send request to LLM Orchestrator
+        llm_data = await call_service_with_logging(
+            "LLM Orchestrator",
+            f"{LLM_ORCHESTRATOR_URL}/generate",
+            payload,
+            request_id=request_id
+        )
+        normalized_query = llm_data.get("response", "").strip()
+        log_with_context(
+            logger, 'info',
+            "NORMALIZE_SUCCESS - Normalization completed successfully",
+            request_id, "/normalize-search",
+            normalized_query=normalized_query,
+            response_preview=truncate_for_log(normalized_query, 200)
+        )
+        return LLMResponse(response=normalized_query, metadata={"source": "llm_orchestrator"})
+    except Exception as e:
+        log_with_context(
+            logger, 'error',
+            "NORMALIZE_ERROR - Error during normalization",
+            request_id, "/normalize-search",
+            error=str(e)
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to normalize search query: {str(e)}")
+
 @app.post("/generate", response_model=LLMResponse)
 async def generate_response(request: LLMRequest):
     """
