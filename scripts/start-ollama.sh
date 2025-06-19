@@ -1,87 +1,212 @@
 #!/bin/bash
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Ollama server..."
+# Enhanced Ollama startup script with improved model readiness checks
+set -e  # Exit on any error
+
+# Debug mode (set DEBUG=1 environment variable to enable verbose logging)
+DEBUG="${DEBUG:-0}"
+
+# Ensure unbuffered output for Docker
+export PYTHONUNBUFFERED=1
+stdbuf -oL -eL bash
+
+# Logging function with timestamp (Docker-friendly)
+log() {
+    # Use both stdout and stderr to ensure visibility
+    printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" | tee /dev/stderr
+    # Force immediate flush
+    sync
+    
+    # Debug mode: also write to a log file
+    if [ "$DEBUG" = "1" ]; then
+        printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> /tmp/ollama-debug.log
+    fi
+}
+
+log "Starting Ollama server..."
 ollama serve &
 SERVER_PID=$!
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ollama server started with PID: $SERVER_PID"
+log "Ollama server started with PID: $SERVER_PID"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for server to initialize..."
+log "Waiting for server to initialize..."
 sleep 10
 
-# Use smaller model that fits in available memory
-MODEL_NAME="${OLLAMA_MODEL:-phi3:mini}"
+# Configuration from environment variables
+MODEL_NAME="${OLLAMA_MODEL:-phi3-mini-8192k:latest}"
 CONTEXT_SIZE="${OLLAMA_CONTEXT_SIZE:-8192}"
+MAX_RETRIES=30
+RETRY_DELAY=2
 
-# ✅ FIXED: Proper model name conversion
-# Replace : and / with - to create safe model names
-SAFE_BASE_NAME=$(echo "$MODEL_NAME" | sed 's/[:\\/]/-/g')
-CUSTOM_MODEL_NAME="${SAFE_BASE_NAME}-${CONTEXT_SIZE}k"
+log "Target model: $MODEL_NAME with ${CONTEXT_SIZE} context"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Target model: $MODEL_NAME with ${CONTEXT_SIZE} context"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Safe base name: $SAFE_BASE_NAME"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Custom model name: $CUSTOM_MODEL_NAME"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking available models..."
-ollama list
-
-# Function to check if specific model exists locally
-check_local_model_exists() {
-    local model_name="$1"
-    local base_model="${model_name%:*}"  # Remove tag if present
-    local model_tag="${model_name#*:}"   # Extract tag, default to 'latest'
+# Function to check if Ollama service is responsive
+check_ollama_service() {
+    local retries=0
+    log "Checking if Ollama service is responsive..."
     
-    # If no tag specified, default to latest
-    if [ "$model_tag" = "$model_name" ]; then
-        model_tag="latest"
+    while [ $retries -lt $MAX_RETRIES ]; do
+        if ollama list >/dev/null 2>&1; then
+            log "✅ Ollama service is responsive!"
+            return 0
+        else
+            log "⏳ Ollama service not ready yet (attempt $((retries + 1))/$MAX_RETRIES)"
+            sleep $RETRY_DELAY
+            retries=$((retries + 1))
+        fi
+    done
+    
+    log "❌ ERROR: Ollama service failed to become responsive after $MAX_RETRIES attempts"
+    return 1
+}
+
+# Function to check if a specific model exists in the list
+model_exists() {
+    local model_name="$1"
+    log "Checking if model '$model_name' exists..."
+    
+    # Try exact match first
+    if ollama list | grep -E "^${model_name}[[:space:]]" >/dev/null 2>&1; then
+        log "✅ Found exact match: $model_name"
+        return 0
     fi
     
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Looking for local model: $base_model:$model_tag"
+    # Try with :latest tag if not already present
+    if [[ "$model_name" != *":"* ]]; then
+        if ollama list | grep -E "^${model_name}:latest[[:space:]]" >/dev/null 2>&1; then
+            log "✅ Found model with :latest tag: ${model_name}:latest"
+            return 0
+        fi
+    fi
     
-    # Check if model directories exist
-    if [ ! -d "/models/ollama/blobs" ] || [ ! -d "/models/ollama/manifests" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Local model directories not found"
+    # Try partial match (base name without tag)
+    local base_name="${model_name%:*}"
+    if ollama list | grep -E "^${base_name}:" >/dev/null 2>&1; then
+        log "✅ Found model with different tag: $base_name"
+        return 0
+    fi
+    
+    log "❌ Model '$model_name' not found"
+    return 1
+}
+
+# Function to test model functionality using Ollama CLI
+test_model_functionality() {
+    local model_name="$1"
+    local test_prompt="Hello"
+    
+    # Explicit debug output
+    echo "🔍 DEBUG: Starting test_model_functionality for $model_name" >&2
+    echo "🔍 DEBUG: Current working directory: $(pwd)" >&2
+    echo "🔍 DEBUG: Ollama version: $(ollama --version 2>/dev/null || echo 'version unknown')" >&2
+    
+    log "🔍 TESTING model functionality for: $model_name" 
+    sleep 1  # Small delay to ensure log appears
+    log "📝 Using test prompt: '$test_prompt'"
+    sleep 1
+    log "⏳ Running: ollama run $model_name (timeout: 30s)"
+    sleep 1
+    
+    # Test using ollama with non-interactive mode and timeout
+    local test_output
+    local start_time=$(date +%s)
+    
+    log "🚀 Executing ollama command now..."
+    
+    # Run test and capture both exit code and output
+    set +e  # Temporarily disable exit on error
+    test_output=$(timeout 30 ollama run "$model_name" <<< "$test_prompt" 2>&1)
+    local exit_code=$?
+    set -e  # Re-enable exit on error
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    log "⏱️  Test completed in ${duration}s with exit code: $exit_code"
+    
+    if [ $exit_code -eq 0 ] && [ -n "$test_output" ] && [ "$test_output" != "$test_prompt" ]; then
+        log "✅ Model '$model_name' is functioning correctly!"
+        # Show a brief preview of the output (first 50 chars)
+        local preview=$(echo "$test_output" | tr -d '\n' | head -c 50)
+        log "   📄 Response preview: $preview..."
+        return 0
+    elif [ $exit_code -eq 124 ]; then
+        log "⏰ Model '$model_name' test timed out after 30 seconds"
+        return 1
+    elif [ -z "$test_output" ]; then
+        log "❌ Model '$model_name' produced no output"
+        return 1
+    elif [ "$test_output" = "$test_prompt" ]; then
+        log "⚠️  Model '$model_name' only echoed the input"
+        log "   📄 Output: $test_output"
+        return 1
+    else
+        log "❌ Model '$model_name' test failed (exit code: $exit_code)"
+        if [ -n "$test_output" ]; then
+            log "   📄 Error output: $(echo "$test_output" | head -c 100)..."
+        fi
         return 1
     fi
+}
+
+# Function to pull model if it doesn't exist
+pull_model() {
+    local model_name="$1"
+    log "Attempting to pull model: $model_name"
     
-    # Check for model manifest (Ollama stores models as manifests + blobs)
-    local manifest_paths=(
-        "/models/ollama/manifests/registry.ollama.ai/library/$base_model/$model_tag"
-        "/models/ollama/manifests/$base_model/$model_tag"
-        "/models/ollama/manifests/$model_name"
-    )
+    if ollama pull "$model_name"; then
+        log "✅ Successfully pulled model: $model_name"
+        return 0
+    else
+        log "❌ Failed to pull model: $model_name"
+        return 1
+    fi
+}
+
+# Function to try alternative models if primary fails
+try_alternative_models() {
+    local alternatives=("tinyllama:latest" "phi3:mini" "gemma:2b" "llama2:latest")
     
-    for manifest_path in "${manifest_paths[@]}"; do
-        if [ -f "$manifest_path" ] || [ -d "$manifest_path" ]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found local model manifest at: $manifest_path"
+    log "Primary model failed, trying alternatives..."
+    
+    for alt_model in "${alternatives[@]}"; do
+        log "Trying alternative model: $alt_model"
+        
+        if model_exists "$alt_model"; then
+            log "✅ Alternative model found: $alt_model"
+            MODEL_NAME="$alt_model"
+            return 0
+        elif pull_model "$alt_model"; then
+            log "✅ Alternative model pulled successfully: $alt_model"
+            MODEL_NAME="$alt_model"
             return 0
         fi
     done
     
-    # Alternative check: look for any manifest containing the model name
-    if find "/models/ollama/manifests" -name "*$base_model*" 2>/dev/null | grep -q .; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found model $base_model in local manifests"
-        return 0
-    fi
-    
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Model $model_name not found locally"
+    log "❌ No alternative models could be loaded"
     return 1
 }
 
-# Function to create custom model with desired context size
+# Function to create custom model with context size (if needed)
 create_custom_model() {
     local base_model="$1"
     local custom_name="$2"
     local ctx_size="$3"
     
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating custom model $custom_name with context size $ctx_size..."
-    
-    # Check if custom model already exists (check multiple possible names)
-    if ollama list | grep -E "^${custom_name}[[:space:]]|^${custom_name}:" | head -1; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Custom model $custom_name already exists"
+    # Skip custom model creation if the model already has the desired context size in name
+    if [[ "$base_model" == *"$ctx_size"* ]]; then
+        log "ℹ️  Model '$base_model' appears to have context size in name, skipping custom model creation"
         return 0
     fi
     
-    # Create temporary Modelfile with enhanced parameters
+    log "Creating custom model '$custom_name' with context size $ctx_size..."
+    
+    # Check if custom model already exists
+    if model_exists "$custom_name"; then
+        log "✅ Custom model '$custom_name' already exists"
+        return 0
+    fi
+    
+    # Create Modelfile
     cat > /tmp/Modelfile << EOF
 FROM $base_model
 PARAMETER num_ctx $ctx_size
@@ -93,159 +218,142 @@ PARAMETER repeat_penalty 1.1
 PARAMETER repeat_last_n 64
 EOF
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Modelfile created with context size $ctx_size"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Modelfile contents:"
-    cat /tmp/Modelfile
-    
-    # Create the custom model
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Executing: ollama create \"$custom_name\" -f /tmp/Modelfile"
+    log "Creating custom model with Modelfile..."
     if ollama create "$custom_name" -f /tmp/Modelfile; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully created custom model $custom_name"
-        
-        # Wait a moment for the model to be ready
-        sleep 3
-        
-        # Test the custom model
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Testing custom model..."
-        if echo "Hello" | timeout 30 ollama run "$custom_name" >/dev/null 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Custom model $custom_name is working correctly!"
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Custom model $custom_name created but may need warm-up"
-        fi
-        
-        # Clean up temporary file
+        log "✅ Successfully created custom model: $custom_name"
         rm -f /tmp/Modelfile
         return 0
     else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create custom model $custom_name"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking if model was created anyway..."
-        ollama list
+        log "❌ Failed to create custom model: $custom_name"
         rm -f /tmp/Modelfile
         return 1
     fi
 }
 
-# Check if the specific model exists locally
-if check_local_model_exists "$MODEL_NAME"; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found local model $MODEL_NAME, copying to container..."
-    # Create models directory if it doesn't exist
-    mkdir -p /root/.ollama/models
-    
-    # Copy all model data (manifests and blobs are interconnected)
-    cp -r /models/ollama/* /root/.ollama/models/
-    
-    if [ $? -eq 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Local model $MODEL_NAME copied successfully"
-        LOCAL_MODEL_COPIED=true
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to copy local model $MODEL_NAME"
-        LOCAL_MODEL_COPIED=false
+# Function to get memory usage
+get_memory_usage() {
+    if command -v free >/dev/null 2>&1; then
+        local mem_info=$(free -h | grep "Mem:")
+        log "Memory usage: $mem_info"
+    elif command -v vm_stat >/dev/null 2>&1; then
+        # macOS
+        local pages_free=$(vm_stat | grep "Pages free" | awk '{print $3}' | sed 's/\.//')
+        local pages_total=$(vm_stat | grep "Pages wired\|Pages active\|Pages inactive\|Pages free" | awk '{sum += $3} END {print sum}')
+        log "Memory: ~$((pages_free * 4096 / 1024 / 1024))MB free of ~$((pages_total * 4096 / 1024 / 1024))MB total"
     fi
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Model $MODEL_NAME not found locally, will pull from registry"
-    LOCAL_MODEL_COPIED=false
-fi
+}
 
-# Function to check model readiness using only ollama CLI
+# Main model readiness check function
 check_model_readiness() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking if Ollama service is ready..."
+    log "=== Starting Enhanced Model Readiness Check ==="
     
-    # Wait for ollama list command to work reliably
-    local retries=0
-    local max_retries=30
-    
-    while [ $retries -lt $max_retries ]; do
-        if ollama list >/dev/null 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ollama service is ready!"
-            break
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ollama service is not ready yet, waiting... (attempt $((retries + 1))/$max_retries)"
-            sleep 2
-            retries=$((retries + 1))
-        fi
-    done
-    
-    if [ $retries -eq $max_retries ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Warning: Ollama service readiness check timed out"
+    # Step 1: Check Ollama service
+    if ! check_ollama_service; then
+        log "❌ FATAL: Ollama service check failed"
         return 1
     fi
-
-    # List current models to see what's available
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Current available models:"
-    ollama list
-
-    # Check if base model exists and is ready
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking for base model: $MODEL_NAME"
     
-    # Check for exact match or with :latest tag
-    if ollama list | grep -E "^$MODEL_NAME[[:space:]]|^${MODEL_NAME}:|^${MODEL_NAME%:*}:latest" | head -1; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Base model $MODEL_NAME is available"
+    # Step 2: Show current available models
+    log "Current available models:"
+    ollama list || log "⚠️  Failed to list models"
+    
+    # Step 3: Show memory usage
+    get_memory_usage
+    
+    # Step 4: Check if target model exists
+    if model_exists "$MODEL_NAME"; then
+        log "✅ Target model '$MODEL_NAME' found!"
+        FINAL_MODEL="$MODEL_NAME"
         
-        # Test model with a simple generation to ensure it's ready
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Testing base model readiness..."
-        if echo "Hello" | timeout 30 ollama run "$MODEL_NAME" >/dev/null 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Base model $MODEL_NAME is ready for inference!"
-            BASE_MODEL_READY=true
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Base model $MODEL_NAME loaded but may need warm-up"
-            BASE_MODEL_READY=true
-        fi
     else
-        if [ "$LOCAL_MODEL_COPIED" = "true" ]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Local model was copied but not showing in list. Waiting for indexing..."
-            sleep 5
-            ollama list
-        fi
+        log "❌ Target model '$MODEL_NAME' not found"
         
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Base model $MODEL_NAME not found, attempting to pull..."
-        ollama pull "$MODEL_NAME"
-        
-        if [ $? -eq 0 ]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully pulled $MODEL_NAME"
-            BASE_MODEL_READY=true
+        # Step 6: Try to pull the model
+        if pull_model "$MODEL_NAME"; then
+            log "✅ Model '$MODEL_NAME' pulled successfully!"
+            FINAL_MODEL="$MODEL_NAME"
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to pull $MODEL_NAME"
-            # Try alternative smaller models if primary fails
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Trying alternative small model: gemma:2b"
-            if ollama pull gemma:2b; then
-                MODEL_NAME="gemma:2b"
-                SAFE_BASE_NAME=$(echo "$MODEL_NAME" | sed 's/[:\\/]/-/g')
-                CUSTOM_MODEL_NAME="${SAFE_BASE_NAME}-${CONTEXT_SIZE}k"
-                BASE_MODEL_READY=true
+            log "❌ Failed to pull target model"
+            
+            # Step 7: Try alternative models
+            if try_alternative_models; then
+                FINAL_MODEL="$MODEL_NAME"  # MODEL_NAME updated by try_alternative_models
             else
-                BASE_MODEL_READY=false
+                log "❌ FATAL: No models available"
+                return 1
             fi
         fi
     fi
     
-    # Create custom model with desired context size if base model is ready
-    if [ "$BASE_MODEL_READY" = "true" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating custom model with $CONTEXT_SIZE context size..."
-        create_custom_model "$MODEL_NAME" "$CUSTOM_MODEL_NAME" "$CONTEXT_SIZE"
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Skipping custom model creation - base model not ready"
+    # Step 8: Create custom model if needed (only for models without context in name)
+    local safe_base_name=$(echo "$FINAL_MODEL" | sed 's/[:\\/]/-/g')
+    local custom_model_name="${safe_base_name}-${CONTEXT_SIZE}k"
+    
+    if create_custom_model "$FINAL_MODEL" "$custom_model_name" "$CONTEXT_SIZE"; then
+        if model_exists "$custom_model_name"; then
+            log "✅ Using custom model: $custom_model_name"
+            FINAL_MODEL="$custom_model_name"
+        fi
     fi
     
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Model setup complete!"
+    # Step 9: Test the FINAL model that will actually be used
+    log "🧪 Starting model functionality test for FINAL model..."
+    echo "🧪 DIRECT ECHO: About to test FINAL model functionality" >&2
+    
+    if test_model_functionality "$FINAL_MODEL"; then
+        log "✅ Final model '$FINAL_MODEL' is ready for use!"
+    else
+        log "⚠️  Final model '$FINAL_MODEL' needs warm-up but will be used anyway"
+    fi
+    
+    echo "🧪 DIRECT ECHO: Final model functionality test completed" >&2
+    log "🧪 Final model functionality test completed"
+    
+    log "=== Model Readiness Check Complete ==="
+    return 0
 }
 
-# Run model readiness check synchronously (not in background)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running model setup..."
-check_model_readiness
+# Copy local models if available (keep existing functionality)
+copy_local_models() {
+    if [ -d "/models/ollama" ]; then
+        log "Checking for local models to copy..."
+        if [ -d "/models/ollama/blobs" ] && [ -d "/models/ollama/manifests" ]; then
+            log "Found local models, copying to container..."
+            mkdir -p /root/.ollama/models
+            cp -r /models/ollama/* /root/.ollama/models/ 2>/dev/null || true
+            log "✅ Local models copied"
+        fi
+    fi
+}
 
-# Show final model status after setup is complete
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Final available models:"
-ollama list
+# Main execution
+main() {
+    log "🚀 Starting Enhanced Ollama Model Setup"
+    
+    # Copy any local models first
+    copy_local_models
+    
+    # Run model readiness check
+    if check_model_readiness; then
+        log "🎉 SUCCESS: Model setup completed successfully!"
+        log "📋 Final model status:"
+        ollama list
+        log "🔧 Recommended model for your applications: $FINAL_MODEL"
+        log "💡 Set DEFAULT_MODEL environment variable to: $FINAL_MODEL"
+    else
+        log "💥 FAILURE: Model setup failed!"
+        log "📋 Available models (if any):"
+        ollama list || log "No models available"
+        log "🔍 Check logs above for troubleshooting information"
+        return 1
+    fi
+    
+    log "✅ Setup complete. Keeping container running..."
+    wait $SERVER_PID
+}
 
-# ✅ FIXED: Better model detection for final message
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking which model to recommend..."
-if ollama list | grep -E "^${CUSTOM_MODEL_NAME}[[:space:]]|^${CUSTOM_MODEL_NAME}:" | head -1; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Use model: $CUSTOM_MODEL_NAME (with ${CONTEXT_SIZE} context)"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔧 Update your LLM orchestrator DEFAULT_MODEL to: $CUSTOM_MODEL_NAME"
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️  Using base model: $MODEL_NAME (default context)"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔧 Update your LLM orchestrator DEFAULT_MODEL to: $MODEL_NAME"
-fi
+# Trap to ensure cleanup
+trap 'log "Received signal, shutting down..."; kill $SERVER_PID 2>/dev/null || true; exit 0' SIGTERM SIGINT
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Setup complete. Keeping container running..."
-wait $SERVER_PID
+# Run main function
+main

@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel,Field,validator
 from typing import List, Dict, Any, Optional, Union
 import os
 from dotenv import load_dotenv
@@ -28,7 +28,8 @@ from functools import lru_cache  # Added missing import
 from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime, Text, text, inspect, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-
+import torch
+import gc
 # Load environment variables
 load_dotenv()
 
@@ -64,7 +65,7 @@ file_handler.setFormatter(formatter)
 
 # Configure root logger
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     handlers=[console_handler, file_handler]
 )
 logger = logging.getLogger(__name__)
@@ -148,6 +149,13 @@ redis_client = redis.from_url(REDIS_URL)
 logger.info("Initializing BGE-small model")
 model = SentenceTransformer('BAAI/bge-small-en')  # Using BGE-small for better performance
 logger.info("BGE-small model initialized successfully")
+
+# Configure device for M2 Mac optimization
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+model = model.to(device)
+
+# Set model to eval mode
+model.eval()
 
 # Validate model embedding dimensions on startup
 try:
@@ -453,56 +461,29 @@ def normalize_text(text: str) -> str:
     
     return normalized
 
-# Enhanced embedding functions with better error handling and logging
+# Helper function for single text embedding (uses the batch function internally)
 async def embed_text_enhanced(text: str, normalize: bool = False) -> List[float]:
-    """Generate embedding for a single text with enhanced error handling."""
+    """
+    Generate embedding for a single text using BGE model.
+    
+    Args:
+        text: Text to embed
+        normalize: Whether to normalize embedding to unit length
+        
+    Returns:
+        List of float values representing the embedding
+    """
     try:
-        # Input validation
-        if not text or not text.strip():
-            raise ValueError("Text cannot be empty")
-        
-        # Truncate if too long (BGE-small has 512 token limit)
-        text = text[:8192]  # Conservative character limit
-        
-        # Tokenize with error handling
-        inputs = tokenizer(
-            [text], 
-            padding=True, 
-            truncation=True, 
-            return_tensors="pt", 
-            max_length=512
+        result = await embed_texts_batch_enhanced(
+            texts=[text],
+            batch_size=1,
+            normalize=normalize,
+            include_metadata=False
         )
-
-        # Move to appropriate device
-        if device.type == "mps":
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            output = model(**inputs)
-
-        # Extract embedding (mean pooling)
-        embedding = output.last_hidden_state.mean(dim=1).cpu().numpy().flatten()
-        
-        # Normalize if requested
-        if normalize:
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-        
-        # Convert to list
-        embedding_list = embedding.tolist()
-
-        # Clean up GPU memory on M2
-        if device.type == "mps":
-            torch.mps.empty_cache()
-
-        return embedding_list
-
+        return result["embeddings"][0] if result["embeddings"] else [0.0] * 384
     except Exception as e:
-        # Clean up on error
-        if device.type == "mps":
-            torch.mps.empty_cache()
-        raise RuntimeError(f"Error generating embedding: {str(e)}")
+        logging.error(f"Error generating single embedding: {str(e)}")
+        return [0.0] * 384  # Return zero embedding on error
 
 async def embed_texts_batch_enhanced(
     texts: List[str], 
@@ -510,7 +491,18 @@ async def embed_texts_batch_enhanced(
     normalize: bool = False,
     include_metadata: bool = False
 ) -> Dict[str, Any]:
-    """Generate embeddings for multiple texts with enhanced batching and metadata."""
+    """
+    Generate embeddings for multiple texts using BGE model with enhanced batching and metadata.
+    
+    Args:
+        texts: List of texts to embed
+        batch_size: Number of texts to process at once (default 8 for M2 Mac)
+        normalize: Whether to normalize embeddings to unit length
+        include_metadata: Whether to include processing metadata
+        
+    Returns:
+        Dictionary containing embeddings and optional metadata
+    """
     start_time = time.time()
     all_embeddings = []
     processing_metadata = {
@@ -520,72 +512,91 @@ async def embed_texts_batch_enhanced(
         "avg_batch_time": 0,
         "total_tokens_processed": 0,
         "device_used": str(device),
-        "model_name": model_name
+        "model_name": model_name,
+        "model_dimension": 384  # BGE-small dimension
     }
     
     batch_times = []
+    logger = logging.getLogger(__name__)
 
     try:
+        # Validate inputs
+        if not texts:
+            return {
+                "embeddings": [],
+                "processing_time_seconds": 0
+            }
+        
         # Process in batches for M2 memory management
         for i in range(0, len(texts), batch_size):
             batch_start_time = time.time()
             batch_texts = texts[i:i + batch_size]
             
-            # Truncate texts in batch
-            batch_texts = [text[:8192] for text in batch_texts]
+            # Truncate texts to reasonable length (BGE handles this internally, but we can pre-truncate for efficiency)
+            batch_texts = [text[:8192] if text else "" for text in batch_texts]
             
-            # Tokenize batch
-            inputs = tokenizer(
-                batch_texts, 
-                padding=True, 
-                truncation=True, 
-                return_tensors="pt", 
-                max_length=512
-            )
-
-            # Track token count for metadata
-            if include_metadata:
-                processing_metadata["total_tokens_processed"] += sum(
-                    (inputs["input_ids"] != tokenizer.pad_token_id).sum().item() 
-                    for _ in range(len(batch_texts))
+            # Log batch processing
+            logger.debug(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+            
+            try:
+                # Use SentenceTransformer's encode method with proper parameters
+                batch_embeddings = model.encode(
+                    batch_texts,
+                    convert_to_tensor=True,  # Keep on GPU/MPS for processing
+                    device=device,
+                    show_progress_bar=False,
+                    batch_size=len(batch_texts),  # Process entire batch at once
+                    normalize_embeddings=normalize  # BGE model can normalize internally
                 )
-
-            # Move to appropriate device
-            if device.type == "mps":
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                output = model(**inputs)
-
-            # Extract embeddings (mean pooling)
-            batch_embeddings = output.last_hidden_state.mean(dim=1).cpu().numpy()
+                
+                # Convert to CPU numpy array for compatibility
+                if isinstance(batch_embeddings, torch.Tensor):
+                    batch_embeddings = batch_embeddings.cpu().numpy()
+                
+                # Ensure embeddings are 2D array
+                if batch_embeddings.ndim == 1:
+                    batch_embeddings = batch_embeddings.reshape(1, -1)
+                
+                # Convert to list format
+                batch_embeddings_list = batch_embeddings.tolist()
+                all_embeddings.extend(batch_embeddings_list)
+                
+                # Track token count for metadata (approximate)
+                if include_metadata:
+                    # BGE uses wordpiece tokenization, estimate ~1.5 tokens per word
+                    for text in batch_texts:
+                        word_count = len(text.split())
+                        processing_metadata["total_tokens_processed"] += int(word_count * 1.5)
+                
+            except Exception as batch_error:
+                logger.error(f"Error processing batch {i//batch_size + 1}: {str(batch_error)}")
+                # Add zero embeddings for failed texts
+                all_embeddings.extend([[0.0] * 384 for _ in batch_texts])
             
-            # Normalize if requested
-            if normalize:
-                norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
-                batch_embeddings = batch_embeddings / np.maximum(norms, 1e-8)
-            
-            # Convert to list and add to results
-            batch_embeddings_list = batch_embeddings.tolist()
-            all_embeddings.extend(batch_embeddings_list)
-
             # Clean up memory after each batch
-            del output, inputs
             if device.type == "mps":
                 torch.mps.empty_cache()
+            gc.collect()
             
             # Record batch timing
             batch_time = time.time() - batch_start_time
             batch_times.append(batch_time)
             processing_metadata["batches_processed"] += 1
             
-            # Force garbage collection for memory management
-            import gc
-            gc.collect()
-
+            # Add small delay between batches to prevent memory buildup on M2
+            if i + batch_size < len(texts):
+                await asyncio.sleep(0.01)  # Small async pause
+        
+        # Validate all embeddings have correct dimension
+        for idx, embedding in enumerate(all_embeddings):
+            if len(embedding) != 384:
+                logger.warning(f"Embedding at index {idx} has incorrect dimension: {len(embedding)}")
+                all_embeddings[idx] = [0.0] * 384  # Replace with zero embedding
+        
         # Calculate metadata
         total_time = time.time() - start_time
         processing_metadata["avg_batch_time"] = sum(batch_times) / len(batch_times) if batch_times else 0
+        processing_metadata["embeddings_per_second"] = len(texts) / total_time if total_time > 0 else 0
         
         result = {
             "embeddings": all_embeddings,
@@ -595,12 +606,18 @@ async def embed_texts_batch_enhanced(
         if include_metadata:
             result["metadata"] = processing_metadata
             
+        logger.info(
+            f"Successfully generated {len(all_embeddings)} embeddings in {total_time:.2f}s "
+            f"({processing_metadata['embeddings_per_second']:.1f} embeddings/sec)"
+        )
+        
         return result
 
     except Exception as e:
         # Clean up on error
         if device.type == "mps":
             torch.mps.empty_cache()
+        logger.error(f"Critical error in batch embedding generation: {str(e)}")
         raise RuntimeError(f"Error in batch embedding generation: {str(e)}")
 
 

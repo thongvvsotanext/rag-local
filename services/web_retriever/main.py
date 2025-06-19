@@ -920,6 +920,7 @@ async def search_searxng(query: str, max_results: int = 5, categories: list = No
                         "crawled_at": datetime.utcnow().isoformat(),
                         "relevance_score": result.get("score", 0.0)
                     })
+                    logger.info(f"Found title: {result.get('title', '')}, result: {result.get('content', '')}")
                 
                 return results
     

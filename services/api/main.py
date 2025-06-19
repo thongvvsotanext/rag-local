@@ -1217,7 +1217,7 @@ async def create_message(
             f"{CONTEXT_MANAGER_URL}/store",
             {
                 "session_id": session_id,
-                "message_text": format_data.get("formatted_response", ""),
+                "message_text": message.message_text,
                 "message_type": "assistant",
                 "sources_used": {
                     "sources": retrieval_data.get("results", []),
@@ -1237,7 +1237,7 @@ async def create_message(
         response = ChatMessage(
             id=store_data.get("message_id"),
             session_id=session_id,
-            message_text=format_data.get("formatted_response", ""),
+            message_text=format_data.get("response", "invalid response"),
             message_type="assistant",
             sources_used={
                 "sources": retrieval_data.get("results", []),

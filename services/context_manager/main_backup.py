@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel,Field,validator
+from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Union
 import os
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker, relationship, Session
 from sqlalchemy.exc import SQLAlchemyError  # Added missing import
 import redis
 import json
+from sentence_transformers import SentenceTransformer
 import sys
 import asyncio
 from contextlib import asynccontextmanager
@@ -24,7 +25,7 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -91,6 +92,11 @@ def get_db():
 # Redis setup
 redis_client = redis.from_url(REDIS_URL)
 
+# Initialize BGE model
+logger.info("Initializing BGE model")
+model = SentenceTransformer('BAAI/bge-small-en')
+logger.info("BGE model initialized successfully")
+
 # Database Models
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
@@ -141,47 +147,26 @@ class ContextResponse(BaseModel):
     session_type: str
     context_sources: List[ContextSource]
 
-class EmbedRequest(BaseModel):
-    """Request model for embedding generation - matches vector service /embed endpoint."""
-    texts: Union[str, List[str]] = Field(..., description="Text or list of texts to embed")
-    batch_size: Optional[int] = Field(8, ge=1, le=32, description="Batch size for processing")
-    normalize_embeddings: Optional[bool] = Field(False, description="Whether to normalize embeddings")
-    include_metadata: Optional[bool] = Field(False, description="Whether to include processing metadata")
-    
-    @validator('texts')
-    def validate_texts(cls, v):
-        if isinstance(v, str):
-            return [v]
-        if isinstance(v, list):
-            if not v:
-                raise ValueError("texts cannot be empty")
-            if len(v) > 32:
-                raise ValueError("Maximum 32 texts allowed for M2 Mac")
-            for i, text in enumerate(v):
-                if not isinstance(text, str):
-                    raise ValueError(f"Text at index {i} must be a string")
-                if len(text.strip()) == 0:
-                    raise ValueError(f"Text at index {i} cannot be empty")
-                if len(text) > 8192:
-                    raise ValueError(f"Text at index {i} too long (max 8192 characters)")
-        return v
+class EmbeddingRequest(BaseModel):
+    texts: Union[str, List[str]]
 
-class EmbedResponse(BaseModel):
-    """Response model for embedding generation - matches vector service /embed endpoint."""
-    embeddings: List[List[float]] = Field(..., description="Generated embeddings")
-    model: str = Field(..., description="Model used for embedding generation")
-    dimension: int = Field(..., description="Embedding dimension")
-    processing_time_seconds: float = Field(..., description="Total processing time")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional processing metadata")
+class EmbeddingResponse(BaseModel):
+    embeddings: List[List[float]]
 
 def cosine_similarity(vec1, vec2):
     """Calculate cosine similarity between two vectors."""
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
-async def get_embeddings(texts: List[str]) -> List[List[float]]:
+async def get_embeddings(texts: Union[str, List[str]]) -> List[List[float]]:
     """Get embeddings from Vector Storage & Retrieval Service with caching."""
+    # Determine cache key based on input type
+    if isinstance(texts, str):
+        cache_key = f"embeddings:{hash(texts)}"
+    else:
+        # Ensure list is hashable for caching
+        cache_key = f"embeddings:{hash(tuple(texts))}"
+
     # Try to get from Redis cache first
-    cache_key = f"embeddings:{hash(tuple(texts))}"
     try:
         cached = redis_client.get(cache_key)
         if cached:
@@ -191,48 +176,19 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
     
     try:
         async with aiohttp.ClientSession() as session:
-            # Prepare the request payload matching the vector retriever's EmbedRequest model
-            payload = {
-                "texts": texts,  # The endpoint accepts both single string and list
-                "batch_size": 8,  # Optimal batch size for M2 Mac
-                "normalize_embeddings": False,  # Keep default behavior
-                "include_metadata": False  # We don't need metadata for context manager
-            }
-            
-            async with session.post(
-                f"{VECTOR_SERVICE_URL}/embed",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)  # Add timeout for reliability
-            ) as response:
+            # The request payload is a simple dictionary
+            payload = {"texts": texts}
+            async with session.post(f"{VECTOR_SERVICE_URL}/embed", json=payload) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.error(f"Failed to get embeddings: {response.status} - {error_text}")
                     return []
                 
-                # Parse the EmbedResponse format
                 data = await response.json()
-                
-                # Extract embeddings from the response
+                # The service response is an EmbedResponse model, we just need the embeddings
                 embeddings = data.get("embeddings", [])
                 
-                # Log useful information from the response
-                if embeddings:
-                    model = data.get("model", "unknown")
-                    dimension = data.get("dimension", 0)
-                    processing_time = data.get("processing_time_seconds", 0)
-                    logger.debug(
-                        f"Got {len(embeddings)} embeddings from model '{model}' "
-                        f"(dim={dimension}) in {processing_time:.3f}s"
-                    )
-                
-                # Validate that we got the expected number of embeddings
-                if len(embeddings) != len(texts):
-                    logger.warning(
-                        f"Embedding count mismatch: requested {len(texts)}, "
-                        f"received {len(embeddings)}"
-                    )
-                
-                # Cache the embeddings
+                # Cache the successful response
                 try:
                     redis_client.setex(
                         cache_key,
@@ -243,44 +199,38 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
                     logger.warning(f"Failed to cache embeddings: {str(e)}")
                 
                 return embeddings
-                
-    except aiohttp.ClientTimeout:
-        logger.error("Timeout while getting embeddings from vector service")
-        return []
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error getting embeddings: {str(e)}")
-        return []
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse embedding response: {str(e)}")
-        return []
     except Exception as e:
-        logger.error(f"Unexpected error getting embeddings: {str(e)}")
+        logger.error(f"Error getting embeddings: {str(e)}", exc_info=True)
         return []
 
-async def get_relevant_messages(query: str, inputHistory: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def get_embedding(text: str) -> List[float]:
+    """Get single embedding using the local BGE model."""
+    try:
+        embedding = model.encode([text])[0]
+        return embedding.tolist()
+    except Exception as e:
+        logger.error(f"Error generating embedding: {str(e)}")
+        return []
+
+async def get_relevant_messages(query: str, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Get relevant messages using embedding similarity."""
     try:
-        if not inputHistory:
+        if not history:
             return []
-        #clone history
-        history = inputHistory.copy()
-        #Insert query at position 0     
-        history.insert(0, {"message": query, "message_type": "user"})
+            
         # Get query embedding
-        query_embeddings = get_embeddings(history)
-        if not query_embeddings:
+        query_embedding = get_embedding(query)
+        if not query_embedding:
             logger.error("Failed to generate query embedding")
             return []
-        current_embedding = query_embeddings[0]
+        
         # Calculate similarities
         similarities = []
-        # for each index in history
-        for i in range(len(history)):
-            msg = history[i]
+        for msg in history:
             if msg.get("message_type") == "user":  # Only compare with user messages
-                msg_embedding = query_embeddings[i]
+                msg_embedding = get_embedding(msg["message"])
                 if msg_embedding:
-                    similarity = cosine_similarity(current_embedding, msg_embedding)
+                    similarity = cosine_similarity(query_embedding, msg_embedding)
                     similarities.append((msg, similarity))
         
         # Sort by similarity and get top 3
@@ -520,7 +470,7 @@ async def store_message(request: StoreMessageRequest):
     try:
         # Log the start of embedding generation
         logger.debug("Generating embeddings for message")
-        embeddings = await get_embeddings([request.message_text])
+        embeddings = await get_embeddings(request.message_text)
         if not embeddings:
             error_msg = "Failed to generate embedding - empty response from embedding service"
             logger.error(error_msg)

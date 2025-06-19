@@ -39,7 +39,7 @@ class FormatRequest(BaseModel):
     format: str = "markdown"
 
 class FormatResponse(BaseModel):
-    answer: str
+    response: str
     citations: List[Citation]
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -144,7 +144,7 @@ async def format_endpoint(request: FormatRequest):
             formatted_response = request.response
         
         return FormatResponse(
-            answer=formatted_response,
+            response=formatted_response,
             citations=citation_list,
             metadata={
                 "format": request.format,

@@ -51,7 +51,7 @@ file_handler.setFormatter(formatter)
 
 # Configure root logger
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     handlers=[console_handler, file_handler]
 )
 logger = logging.getLogger(__name__)
@@ -1274,7 +1274,6 @@ async def generate_response(request: LLMRequest):
             # Model information
             model=result['metadata']['model'],
             context_size=result['metadata']['context_size'],
-            custom_model_used=result['metadata']['custom_model_used'],
             # Generation parameters used
             generation_params_used=result['metadata']['generation_params'],
             # Full content (only if enabled)
